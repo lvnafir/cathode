@@ -1,6 +1,7 @@
 use crate::api::{Video, YouTubeSource};
 use crate::config::Config;
-use std::collections::HashMap;
+use crate::history::TfidfProfile;
+use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::path::Path;
 use std::sync::Arc;
@@ -42,9 +43,7 @@ pub fn fetch_subscription_feed<S: YouTubeSource + Send + Sync + 'static>(
         .map(|sub| {
             let src = Arc::clone(source);
             let id = sub.channel_id.clone();
-            thread::spawn(move || {
-                src.channel_videos(&id).unwrap_or_default()
-            })
+            thread::spawn(move || src.channel_videos(&id).unwrap_or_default())
         })
         .collect();
 
@@ -57,24 +56,53 @@ pub fn fetch_subscription_feed<S: YouTubeSource + Send + Sync + 'static>(
     all_videos
 }
 
+/// Precomputed recommendation data, passed across thread boundary.
+/// Lightweight model weights that can cross thread boundaries.
+pub struct ModelWeights {
+    pub weights: HashMap<String, f64>,
+    pub bias: f64,
+    pub trained: bool,
+}
+
+impl ModelWeights {
+    pub fn predict(&self, title: &str) -> f64 {
+        if !self.trained {
+            return 0.5; // neutral when untrained
+        }
+        let tokens: Vec<String> = title
+            .split_whitespace()
+            .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase())
+            .filter(|w| w.len() >= 3)
+            .collect();
+        let z: f64 = self.bias
+            + tokens.iter().map(|t| self.weights.get(t).copied().unwrap_or(0.0)).sum::<f64>();
+        1.0 / (1.0 + (-z).exp())
+    }
+}
+
+pub struct RecommenderData {
+    pub affinity: HashMap<String, f64>,
+    pub ucb1: HashMap<String, f64>,
+    pub tfidf: TfidfProfile,
+    pub model: ModelWeights,
+    pub serendipity_query: Option<String>,
+    pub watched_channels: HashSet<String>,
+}
+
 pub struct CuratedFeed {
     pub videos: Vec<Video>,
     pub sampled_channels: Vec<String>,
 }
 
-/// Build a mixed feed weighted by watch history.
-///
-/// Channel selection: weighted random sampling. Channels you watch more
-/// get picked more often, but every channel has a floor so nothing gets
-/// starved entirely (discovery stays alive).
-///
-/// Search queries: mix of configured searches + topic keywords extracted
-/// from your watch history titles.
+/// Build a feed using composite scoring:
+///   0.4 * tfidf_similarity (content match)
+///   0.3 * ucb1_score (explore/exploit balance)
+///   0.2 * channel_affinity (watch history)
+///   0.1 * serendipity bonus
 pub fn fetch_curated_feed<S: YouTubeSource + Send + Sync + 'static>(
     source: &Arc<S>,
     config: &Config,
-    affinity: &HashMap<String, f64>,
-    topic_keywords: &[String],
+    rec: &RecommenderData,
 ) -> CuratedFeed {
     let seed = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -82,18 +110,19 @@ pub fn fetch_curated_feed<S: YouTubeSource + Send + Sync + 'static>(
         .as_secs();
     let mut rng = seed;
 
-    // Build weighted channel list: affinity score + floor of 1.0
+    // UCB1-weighted channel selection
     let weights: Vec<(usize, f64)> = config
         .channels
         .iter()
         .enumerate()
         .map(|(i, ch)| {
-            let score = affinity.get(&ch.id).copied().unwrap_or(0.0);
-            (i, 1.0 + score) // floor of 1.0 so every channel has a chance
+            let ucb = rec.ucb1.get(&ch.id).copied().unwrap_or(0.0);
+            let affinity = rec.affinity.get(&ch.id).copied().unwrap_or(0.0);
+            // Blend UCB1 (explore/exploit) with affinity (pure preference)
+            (i, 1.0 + 0.6 * ucb + 0.4 * affinity)
         })
         .collect();
 
-    // Weighted random sample without replacement
     let n_channels = config.feed_sample.min(config.channels.len());
     let selected = weighted_sample(&weights, n_channels, &mut rng);
 
@@ -102,22 +131,16 @@ pub fn fetch_curated_feed<S: YouTubeSource + Send + Sync + 'static>(
         .map(|&idx| config.channels[idx].clone())
         .collect();
 
-    // Search queries: pick from configured + topic keywords
-    let mut all_queries: Vec<String> = config.searches.clone();
-    for kw in topic_keywords {
-        // Combine nearby keywords into queries
-        all_queries.push(kw.clone());
-    }
-
-    let search_query = if !all_queries.is_empty() {
+    // Search queries from config
+    let search_query = if !config.searches.is_empty() {
         rng = xorshift(rng);
-        let idx = (rng as usize) % all_queries.len();
-        Some(all_queries[idx].clone())
+        let idx = (rng as usize) % config.searches.len();
+        Some(config.searches[idx].clone())
     } else {
         None
     };
 
-    // Parallel fetch
+    // Parallel fetch: channels + config search + serendipity
     let mut handles = Vec::new();
 
     for ch in &selected_channels {
@@ -128,9 +151,9 @@ pub fn fetch_curated_feed<S: YouTubeSource + Send + Sync + 'static>(
             match src.channel_videos(&id) {
                 Ok(mut videos) => {
                     videos.truncate(3);
-                    (videos, Some(name))
+                    (videos, Some(name), false)
                 }
-                Err(_) => (Vec::new(), None),
+                Err(_) => (Vec::new(), None, false),
             }
         }));
     }
@@ -141,19 +164,40 @@ pub fn fetch_curated_feed<S: YouTubeSource + Send + Sync + 'static>(
             match src.search(&query) {
                 Ok(mut videos) => {
                     videos.truncate(5);
-                    (videos, None)
+                    (videos, None, false)
                 }
-                Err(_) => (Vec::new(), None),
+                Err(_) => (Vec::new(), None, false),
             }
         }));
     }
 
-    // Collect
+    // Serendipity slot: search with a lateral query, flag as serendipity
+    if let Some(ref query) = rec.serendipity_query {
+        let src = Arc::clone(source);
+        let q = query.clone();
+        let watched = rec.watched_channels.clone();
+        handles.push(thread::spawn(move || {
+            match src.search(&q) {
+                Ok(videos) => {
+                    // Filter to channels never watched
+                    let novel: Vec<Video> = videos
+                        .into_iter()
+                        .filter(|v| !v.channel_id.is_empty() && !watched.contains(&v.channel_id))
+                        .take(2)
+                        .collect();
+                    (novel, None, true)
+                }
+                Err(_) => (Vec::new(), None, true),
+            }
+        }));
+    }
+
+    // Collect results
     let mut all_videos = Vec::new();
     let mut sampled_channels = Vec::new();
 
     for handle in handles {
-        if let Ok((videos, name)) = handle.join() {
+        if let Ok((videos, name, _is_serendipity)) = handle.join() {
             all_videos.extend(videos);
             if let Some(n) = name {
                 sampled_channels.push(n);
@@ -161,18 +205,50 @@ pub fn fetch_curated_feed<S: YouTubeSource + Send + Sync + 'static>(
         }
     }
 
-    // Shuffle the final mix
-    for i in (1..all_videos.len()).rev() {
+    // Score and sort by composite score
+    // When the model is trained, it gets weight. Otherwise TF-IDF carries it.
+    let model_weight = if rec.model.trained { 0.25 } else { 0.0 };
+    let tfidf_weight = if rec.model.trained { 0.25 } else { 0.4 };
+
+    let mut scored: Vec<(f64, Video)> = all_videos
+        .into_iter()
+        .map(|v| {
+            let tfidf_score = rec.tfidf.score_title(&v.title);
+            let model_score = rec.model.predict(&v.title); // 0.0 to 1.0
+            let ucb = rec.ucb1.get(&v.channel_id).copied().unwrap_or(0.0);
+            let affinity = rec.affinity.get(&v.channel_id).copied().unwrap_or(0.0);
+            let is_novel = !v.channel_id.is_empty() && !rec.watched_channels.contains(&v.channel_id);
+            let novelty_bonus = if is_novel { 1.0 } else { 0.0 };
+
+            let score = tfidf_weight * tfidf_score
+                + model_weight * model_score
+                + 0.3 * ucb.min(5.0) / 5.0
+                + 0.1 * affinity.min(10.0) / 10.0
+                + 0.1 * novelty_bonus;
+
+            (score, v)
+        })
+        .collect();
+
+    // Sort descending by score, then add some shuffle within similar scores
+    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+
+    // Light shuffle: swap adjacent items with small probability to avoid rigid ordering
+    for i in 0..scored.len().saturating_sub(1) {
         rng = xorshift(rng);
-        let j = (rng as usize) % (i + 1);
-        all_videos.swap(i, j);
+        if rng % 4 == 0 {
+            scored.swap(i, i + 1);
+        }
     }
 
-    CuratedFeed { videos: all_videos, sampled_channels }
+    let videos = scored.into_iter().map(|(_, v)| v).collect();
+
+    CuratedFeed {
+        videos,
+        sampled_channels,
+    }
 }
 
-/// Weighted random sampling without replacement.
-/// Uses the "selection by cumulative weight" approach.
 fn weighted_sample(weights: &[(usize, f64)], n: usize, rng: &mut u64) -> Vec<usize> {
     let mut pool: Vec<(usize, f64)> = weights.to_vec();
     let mut picked = Vec::with_capacity(n);
@@ -208,7 +284,9 @@ fn weighted_sample(weights: &[(usize, f64)], n: usize, rng: &mut u64) -> Vec<usi
 }
 
 fn xorshift(mut x: u64) -> u64 {
-    if x == 0 { x = 1; }
+    if x == 0 {
+        x = 1;
+    }
     x ^= x << 13;
     x ^= x >> 7;
     x ^= x << 17;

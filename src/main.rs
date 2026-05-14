@@ -3,6 +3,7 @@ mod app;
 mod config;
 mod feed;
 mod history;
+mod model;
 mod ui;
 
 use app::{App, AppState, FeedKind};
@@ -30,6 +31,7 @@ enum WorkerMsg {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut config = Config::load();
     let mut history = History::load();
+    let mut click_model = model::ClickModel::load();
 
     let source = Arc::new(YtdlpSource);
 
@@ -40,7 +42,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut terminal = Terminal::new(backend)?;
 
     let mut app = App::new();
-    let mut rx: Option<mpsc::Receiver<WorkerMsg>> = Some(spawn_fetch_feed(&config, &source, &history));
+    let mut rx: Option<mpsc::Receiver<WorkerMsg>> = Some(spawn_fetch_feed(&config, &source, &mut history, &click_model));
 
     loop {
         app.tick();
@@ -49,6 +51,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Some(ref receiver) = rx {
             match receiver.try_recv() {
                 Ok(WorkerMsg::Videos(videos, kind)) => {
+                    // Train negative on outgoing feed (shown but not watched)
+                    train_skips(&mut click_model, &app.videos);
                     app.feed_kind = kind;
                     app.set_videos(videos);
                     rx = None;
@@ -95,7 +99,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         KeyCode::Char('r') => {
                             app.state = AppState::Loading;
                             app.status_msg = "refreshing...".into();
-                            rx = Some(spawn_fetch_feed(&config, &source, &history));
+                            rx = Some(spawn_fetch_feed(&config, &source, &mut history, &click_model));
                         }
                         KeyCode::Enter => {
                             app.enter_quality(config.max_resolution);
@@ -131,9 +135,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 .status();
                             let watch_secs = watch_start.elapsed().as_secs();
 
-                            // Log watch
+                            // Log watch + train model
                             if let Some((vid, ch_id, ch_name, title)) = video_info {
                                 history.log_watch(&vid, &ch_id, &ch_name, &title, "", watch_secs);
+                                click_model.train_positive(&title);
+                                click_model.flush();
                             }
 
                             show_terminal(win);
@@ -179,7 +185,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         KeyCode::Char('r') => {
                             app.state = AppState::Loading;
                             app.status_msg = "retrying...".into();
-                            rx = Some(spawn_fetch_feed(&config, &source, &history));
+                            rx = Some(spawn_fetch_feed(&config, &source, &mut history, &click_model));
                         }
                         _ => {}
                     },
@@ -188,18 +194,49 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // Train negative on remaining feed videos and save
+    train_skips(&mut click_model, &app.videos);
+    click_model.flush();
+
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     Ok(())
 }
 
-fn spawn_fetch_feed(config: &Config, source: &Arc<YtdlpSource>, history: &History) -> mpsc::Receiver<WorkerMsg> {
+fn train_skips(model: &mut model::ClickModel, videos: &[Video]) {
+    for video in videos {
+        if !video.title.is_empty() {
+            model.train_negative(&video.title);
+        }
+    }
+}
+
+fn spawn_fetch_feed(config: &Config, source: &Arc<YtdlpSource>, history: &mut History, click_model: &model::ClickModel) -> mpsc::Receiver<WorkerMsg> {
     let (tx, rx) = mpsc::channel();
     let config = config.clone();
     let source = Arc::clone(source);
-    // Precompute history data so we don't need to send History across threads
-    let affinity = history.channel_affinity();
-    let topic_keywords = history.topic_keywords(5);
+
+    // Precompute all recommendation data
+    let tfidf = history.tfidf_profile();
+    let mut rng = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let serendipity_query = history.serendipity_query(&tfidf, &mut rng);
+    let (mw, mb, mt) = click_model.export_weights();
+    let rec = feed::RecommenderData {
+        affinity: history.channel_affinity(),
+        ucb1: history.ucb1_scores(),
+        tfidf,
+        model: feed::ModelWeights { weights: mw, bias: mb, trained: mt },
+        serendipity_query,
+        watched_channels: history.watched_channels(),
+    };
+
+    // Log impressions for all followed channels being considered
+    let channel_ids: Vec<String> = config.channels.iter().map(|c| c.id.clone()).collect();
+    history.log_impressions(&channel_ids);
+
     thread::spawn(move || {
         // Try subscriptions CSV first
         let subs = feed::load_subscriptions();
@@ -211,9 +248,9 @@ fn spawn_fetch_feed(config: &Config, source: &Arc<YtdlpSource>, history: &Histor
             }
         }
 
-        // Curated feed: random sample of channels + search queries (parallel)
+        // Curated feed with composite scoring
         if !config.channels.is_empty() {
-            let result = feed::fetch_curated_feed(&source, &config, &affinity, &topic_keywords);
+            let result = feed::fetch_curated_feed(&source, &config, &rec);
             if !result.videos.is_empty() {
                 let _ = tx.send(WorkerMsg::Videos(result.videos, FeedKind::Curated(result.sampled_channels)));
                 return;

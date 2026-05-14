@@ -23,10 +23,10 @@ echo ""
 
 # --- install runtime deps ---
 
-DEPS=(yt-dlp mpv curl)
+PACMAN_DEPS=(mpv curl)
 MISSING=()
 
-for dep in "${DEPS[@]}"; do
+for dep in "${PACMAN_DEPS[@]}"; do
     if ! pacman -Qi "$dep" &>/dev/null; then
         MISSING+=("$dep")
     fi
@@ -36,7 +36,15 @@ if [ ${#MISSING[@]} -gt 0 ]; then
     echo "[1/4] Installing runtime deps: ${MISSING[*]}"
     sudo pacman -S --needed --noconfirm "${MISSING[@]}"
 else
-    echo "[1/4] Runtime deps present (${DEPS[*]})"
+    echo "[1/4] Runtime deps present (${PACMAN_DEPS[*]})"
+fi
+
+# yt-dlp: accept either pacman or pip version
+if ! command -v yt-dlp &>/dev/null; then
+    echo "       Installing yt-dlp via pacman..."
+    sudo pacman -S --needed --noconfirm yt-dlp || pip install --user yt-dlp
+else
+    echo "       yt-dlp present ($(yt-dlp --version 2>/dev/null || echo unknown))"
 fi
 
 # --- ensure rust toolchain ---
